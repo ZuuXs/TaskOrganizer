@@ -131,6 +131,56 @@ class GoogleCalendarManager:
         )
         return created
 
+    def list_calendars(self) -> List[Dict[str, Any]]:
+        """
+        Liste tous les calendriers du compte Google (principal + abonnements).
+        Retourne une liste de dicts avec 'id', 'summary', 'backgroundColor'.
+        """
+        if not self.is_authenticated():
+            raise OAuthError("Non authentifié. Appelez authenticate() d'abord.")
+
+        result = self.service.calendarList().list().execute()
+        calendars = result.get("items", [])
+        # Trier : primary en premier, puis alphabétique
+        calendars.sort(key=lambda c: (0 if c.get("primary") else 1, c.get("summary", "")))
+        return calendars
+
+    def get_events_from_calendars(
+        self, calendar_ids: List[str], days_ahead: int = 30
+    ) -> List[Dict[str, Any]]:
+        """
+        Récupère les événements depuis plusieurs calendriers.
+        Chaque événement est augmenté d'un champ '_calendar_id'.
+        """
+        if not self.is_authenticated():
+            raise OAuthError("Non authentifié. Appelez authenticate() d'abord.")
+
+        now = datetime.utcnow().isoformat() + "Z"
+        future = (datetime.utcnow() + timedelta(days=days_ahead)).isoformat() + "Z"
+
+        all_events = []
+        for cal_id in calendar_ids:
+            try:
+                events_result = (
+                    self.service.events()
+                    .list(
+                        calendarId=cal_id,
+                        timeMin=now,
+                        timeMax=future,
+                        singleEvents=True,
+                        orderBy="startTime",
+                    )
+                    .execute()
+                )
+                events = events_result.get("items", [])
+                for e in events:
+                    e["_calendar_id"] = cal_id
+                all_events.extend(events)
+            except Exception:
+                continue
+
+        return all_events
+
     def parse_events_to_slots(self, events: List[Dict]) -> List[Dict]:
         """
         Convertit une liste d'événements Google Calendar en créneaux occupés

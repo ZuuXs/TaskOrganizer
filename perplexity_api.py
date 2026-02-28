@@ -16,7 +16,7 @@ class PerplexityAPI:
     """Client pour l'API Perplexity (chat completions)."""
 
     BASE_URL = "https://api.perplexity.ai"
-    DEFAULT_MODEL = "llama-3.1-sonar-small-128k-online"
+    DEFAULT_MODEL = "sonar"
 
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("PERPLEXITY_API_KEY", "")
