@@ -138,6 +138,7 @@ def _init_state():
         "extraction_suggestions": "",
         "export_done": [],                # block_keys already exported
         "exported_blocks_detail": [],     # [{date, start_time, end_time, title}]
+        "exported_task_ids": [],          # IDs de tâches entièrement exportées
         "ai_advice": "",
         "available_calendars": [],        # liste des agendas Google disponibles
         "selected_calendar_ids": [],      # IDs d'agendas à synchroniser
@@ -174,13 +175,19 @@ def _task_card_html(task: Task) -> str:
         timing = f"{urgency} ({task.deadline.strftime('%d/%m/%Y')})"
 
     recurring_badge = ' <span style="font-size:0.8em;color:#7f8c8d;">🔄 Récurrent</span>' if task.is_recurring else ""
+    new_badge = ' <span style="font-size:0.78em;background:#f39c12;color:white;padding:1px 6px;border-radius:10px;">NEW</span>' if task.is_new else ""
+    warning_html = (
+        f'<br><span style="color:#e67e22;font-size:0.85em;">⚠️ {task.schedule_warning}</span>'
+        if task.schedule_warning else ""
+    )
 
     return f"""
 <div class="task-card {cls}">
   <strong>{task.title}</strong>
-  {_priority_badge(task.priority)}{recurring_badge}
+  {_priority_badge(task.priority)}{recurring_badge}{new_badge}
   <br>
   ⏱️ {task.duration_hours:.1f}h &nbsp;|&nbsp; {timing}
+  {warning_html}
   {"<br><em>" + task.notes + "</em>" if task.notes else ""}
 </div>
 """
@@ -312,25 +319,69 @@ with tab1:
                         st.session_state.extraction_suggestions = result.get(
                             "planning_suggestions", ""
                         )
+                        total_added = 0
                         for raw in extracted:
+                            title = raw.get("title", "Tâche sans nom")
+                            dur = float(raw.get("duration_hours", 2.0))
+                            priority = raw.get("priority", "Normale")
+                            notes = raw.get("notes", "")
+
+                            # Deadline de base
                             try:
-                                deadline = datetime.strptime(
-                                    raw["deadline"], "%Y-%m-%d"
-                                ).date()
+                                deadline = datetime.strptime(raw["deadline"], "%Y-%m-%d").date()
                             except Exception:
                                 deadline = date.today() + timedelta(days=7)
 
-                            task = Task(
-                                title=raw.get("title", "Tâche sans nom"),
-                                duration_hours=float(raw.get("duration_hours", 2.0)),
-                                deadline=deadline,
-                                priority=raw.get("priority", "Normale"),
-                                notes=raw.get("notes", ""),
-                            )
-                            st.session_state.tasks.append(task)
+                            # Heure exacte
+                            exact_dt = None
+                            if raw.get("exact_datetime"):
+                                try:
+                                    exact_dt = datetime.fromisoformat(raw["exact_datetime"])
+                                    deadline = exact_dt.date()
+                                except Exception:
+                                    exact_dt = None
+
+                            # Récurrence
+                            recurrence = raw.get("recurrence")
+                            if recurrence and recurrence.get("pattern"):
+                                pattern = recurrence["pattern"]
+                                try:
+                                    end_date = datetime.strptime(recurrence["end_date"], "%Y-%m-%d").date()
+                                except Exception:
+                                    end_date = date.today() + timedelta(days=7)
+                                end_date = min(end_date, date.today() + timedelta(days=31))
+                                delta = timedelta(days=1) if pattern == "daily" else timedelta(weeks=1)
+                                current_day = exact_dt.date() if exact_dt else date.today()
+                                count = 0
+                                while current_day <= end_date and count < 31:
+                                    pin_dt = datetime.combine(current_day, exact_dt.time()) if exact_dt else None
+                                    st.session_state.tasks.append(Task(
+                                        title=title,
+                                        duration_hours=dur,
+                                        deadline=current_day,
+                                        priority=priority,
+                                        notes=notes,
+                                        pin_datetime=pin_dt,
+                                        not_before=current_day,  # récurrence : seulement ce jour
+                                        is_recurring=True,
+                                        recurrence_label=title,
+                                    ))
+                                    count += 1
+                                    total_added += 1
+                                    current_day += delta
+                            else:
+                                st.session_state.tasks.append(Task(
+                                    title=title,
+                                    duration_hours=dur,
+                                    deadline=deadline,
+                                    priority=priority,
+                                    notes=notes,
+                                    pin_datetime=exact_dt,
+                                ))
+                                total_added += 1
 
                         st.success(
-                            f"✅ {len(extracted)} tâche(s) extraite(s) et ajoutée(s) !"
+                            f"✅ {total_added} tâche(s) extraite(s) et ajoutée(s) !"
                         )
                         if st.session_state.extraction_suggestions:
                             st.info(
@@ -341,89 +392,113 @@ with tab1:
 
     # ── Liste des tâches ──
     st.markdown("---")
-    st.subheader(f"📋 Tâches enregistrées ({len(st.session_state.tasks)})")
+    total = len(st.session_state.tasks)
+    new_count = sum(1 for t in st.session_state.tasks if t.is_new)
+    st.subheader(f"📋 Tâches enregistrées ({total})")
 
     if not st.session_state.tasks:
         st.info("Aucune tâche pour le moment. Utilisez le prompt ci-dessus ou ajoutez une tâche manuellement.")
 
+    # Grouper par statut : nouvelles vs déjà planifiées
+    new_tasks_grp = [(i, t) for i, t in enumerate(st.session_state.tasks) if t.is_new]
+    reg_tasks_grp = [(i, t) for i, t in enumerate(st.session_state.tasks) if not t.is_new]
+
+    groups = []
+    if new_tasks_grp:
+        groups.append(("🆕 Nouvelles tâches — pas encore planifiées", "#fff9e6", "#f39c12", new_tasks_grp))
+    if reg_tasks_grp:
+        groups.append(("📅 Tâches du planning actuel", "#e8f4fd", "#2980b9", reg_tasks_grp))
+
     tasks_to_delete = []
-    for idx, task in enumerate(st.session_state.tasks):
-        prio_icon = "🔴" if task.priority == "Haute" else "🔵" if task.priority == "Normale" else "🟢"
-        recurring_tag = " 🔄" if task.is_recurring else ""
-        pin_tag = f" 📌{task.pin_datetime.strftime('%d/%m %H:%M')}" if task.pin_datetime else f" — deadline {task.deadline.strftime('%d/%m/%Y')}"
-        with st.expander(
-            f"{prio_icon}{recurring_tag} {task.title} — {task.duration_hours:.1f}h{pin_tag}",
-            expanded=False,
-        ):
-            col_a, col_b = st.columns(2)
-            with col_a:
-                new_title = st.text_input(
-                    "Titre", value=task.title, key=f"title_{task.id}"
-                )
-                new_dur = st.number_input(
-                    "Durée (heures)",
-                    min_value=0.1,
-                    max_value=100.0,
-                    value=task.duration_hours,
-                    step=0.5,
-                    key=f"dur_{task.id}",
-                )
-            with col_b:
-                new_deadline = st.date_input(
-                    "Deadline",
-                    value=task.deadline,
-                    key=f"dl_{task.id}",
-                )
-                new_priority = st.selectbox(
-                    "Priorité",
-                    ["Basse", "Normale", "Haute"],
-                    index=["Basse", "Normale", "Haute"].index(task.priority),
-                    key=f"prio_{task.id}",
-                )
-            new_notes = st.text_input(
-                "Notes", value=task.notes, key=f"notes_{task.id}"
-            )
 
-            # Édition heure exacte
-            st.markdown("**📌 Heure exacte**")
-            ep1, ep2, ep3 = st.columns([1, 1, 2])
-            with ep1:
-                keep_pin = st.checkbox(
-                    "Heure fixée",
-                    value=task.pin_datetime is not None,
-                    key=f"pin_chk_{task.id}",
-                )
-            with ep2:
-                edit_pin_date = st.date_input(
-                    "Date",
-                    value=task.pin_datetime.date() if task.pin_datetime else task.deadline,
-                    key=f"pin_d_{task.id}",
-                )
-            with ep3:
-                edit_pin_time = st.time_input(
-                    "Heure",
-                    value=task.pin_datetime.time() if task.pin_datetime else time(9, 0),
-                    key=f"pin_t_{task.id}",
+    for group_label, bg, border, tasks_group in groups:
+        st.markdown(
+            f'<div style="background:{bg};border-left:4px solid {border};padding:8px 14px;'
+            f'border-radius:6px;margin:12px 0 6px 0;">'
+            f'<strong>{group_label}</strong> '
+            f'<span style="color:#666;">({len(tasks_group)})</span></div>',
+            unsafe_allow_html=True,
+        )
+        for idx, task in tasks_group:
+            prio_icon = "🔴" if task.priority == "Haute" else "🔵" if task.priority == "Normale" else "🟢"
+            recurring_tag = " 🔄" if task.is_recurring else ""
+            pin_tag = f" 📌{task.pin_datetime.strftime('%d/%m %H:%M')}" if task.pin_datetime else f" — deadline {task.deadline.strftime('%d/%m/%Y')}"
+            warn_tag = " ⚠️" if task.schedule_warning else ""
+            with st.expander(
+                f"{prio_icon}{recurring_tag}{warn_tag} {task.title} — {task.duration_hours:.1f}h{pin_tag}",
+                expanded=False,
+            ):
+                if task.schedule_warning:
+                    st.warning(f"⚠️ {task.schedule_warning}")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    new_title = st.text_input(
+                        "Titre", value=task.title, key=f"title_{task.id}"
+                    )
+                    new_dur = st.number_input(
+                        "Durée (heures)",
+                        min_value=0.1,
+                        max_value=100.0,
+                        value=task.duration_hours,
+                        step=0.5,
+                        key=f"dur_{task.id}",
+                    )
+                with col_b:
+                    new_deadline = st.date_input(
+                        "Deadline",
+                        value=task.deadline,
+                        key=f"dl_{task.id}",
+                    )
+                    new_priority = st.selectbox(
+                        "Priorité",
+                        ["Basse", "Normale", "Haute"],
+                        index=["Basse", "Normale", "Haute"].index(task.priority),
+                        key=f"prio_{task.id}",
+                    )
+                new_notes = st.text_input(
+                    "Notes", value=task.notes, key=f"notes_{task.id}"
                 )
 
-            col_save, col_del = st.columns([3, 1])
-            with col_save:
-                if st.button("💾 Enregistrer", key=f"save_{task.id}"):
-                    task.title = new_title
-                    task.duration_hours = new_dur
-                    task.deadline = new_deadline
-                    task.priority = new_priority
-                    task.notes = new_notes
-                    if keep_pin:
-                        task.pin_datetime = datetime.combine(edit_pin_date, edit_pin_time)
-                        task.deadline = edit_pin_date
-                    else:
-                        task.pin_datetime = None
-                    st.success("Tâche mise à jour !")
-                    st.rerun()
-            with col_del:
-                if st.button("🗑️ Supprimer", key=f"del_{task.id}"):
-                    tasks_to_delete.append(idx)
+                # Édition heure exacte
+                st.markdown("**📌 Heure exacte**")
+                ep1, ep2, ep3 = st.columns([1, 1, 2])
+                with ep1:
+                    keep_pin = st.checkbox(
+                        "Heure fixée",
+                        value=task.pin_datetime is not None,
+                        key=f"pin_chk_{task.id}",
+                    )
+                with ep2:
+                    edit_pin_date = st.date_input(
+                        "Date",
+                        value=task.pin_datetime.date() if task.pin_datetime else task.deadline,
+                        key=f"pin_d_{task.id}",
+                    )
+                with ep3:
+                    edit_pin_time = st.time_input(
+                        "Heure",
+                        value=task.pin_datetime.time() if task.pin_datetime else time(9, 0),
+                        key=f"pin_t_{task.id}",
+                    )
+
+                col_save, col_del = st.columns([3, 1])
+                with col_save:
+                    if st.button("💾 Enregistrer", key=f"save_{task.id}"):
+                        task.title = new_title
+                        task.duration_hours = new_dur
+                        task.deadline = new_deadline
+                        task.priority = new_priority
+                        task.notes = new_notes
+                        if keep_pin:
+                            task.pin_datetime = datetime.combine(edit_pin_date, edit_pin_time)
+                            task.deadline = edit_pin_date
+                        else:
+                            task.pin_datetime = None
+                        st.success("Tâche mise à jour !")
+                        st.rerun()
+                with col_del:
+                    if st.button("🗑️ Supprimer", key=f"del_{task.id}"):
+                        tasks_to_delete.append(idx)
 
     if tasks_to_delete:
         for i in sorted(tasks_to_delete, reverse=True):
@@ -540,6 +615,7 @@ with tab1:
                                 priority=r_priority,
                                 notes=r_notes,
                                 pin_datetime=pin_dt,
+                                not_before=current_day,  # récurrence : planifier seulement ce jour
                                 is_recurring=True,
                                 recurrence_label=r_title.strip(),
                             )
@@ -769,8 +845,13 @@ with tab3:
                 st.warning("Ajoutez des tâches dans l'onglet 'Tâches' d'abord.")
             else:
                 with st.spinner("Calcul du planning optimal..."):
-                    # Les blocs déjà exportés deviennent des créneaux occupés
-                    # pour éviter que le planificateur les réutilise
+                    # Exclure les tâches déjà exportées vers Google Calendar
+                    exported_ids = set(st.session_state.exported_task_ids)
+                    tasks_to_plan = [
+                        t for t in st.session_state.tasks
+                        if t.id not in exported_ids
+                    ]
+                    # Les blocs exportés bloquent les créneaux pour les autres tâches
                     exported_as_occupied = [
                         OccupiedSlot(
                             date=b["date"],
@@ -782,12 +863,25 @@ with tab3:
                         for b in st.session_state.exported_blocks_detail
                     ]
                     scheduler = TaskScheduler(
-                        tasks=st.session_state.tasks,
+                        tasks=tasks_to_plan,
                         occupied_slots=st.session_state.occupied_slots + exported_as_occupied,
                         constraints=constraints,
                     )
-                    st.session_state.schedule_result = scheduler.generate_schedule()
+                    result_gen = scheduler.generate_schedule()
+                    st.session_state.schedule_result = result_gen
                     st.session_state.ai_advice = ""
+
+                    # Propager is_new=False et schedule_warning vers les tâches originales
+                    all_processed = result_gen.scheduled_tasks + result_gen.impossible_tasks
+                    warning_map = {t.id: t.schedule_warning for t in all_processed if t.schedule_warning}
+                    processed_ids = {t.id for t in all_processed}
+                    for task in st.session_state.tasks:
+                        if task.id in processed_ids:
+                            task.is_new = False
+                        if task.id in warning_map:
+                            task.schedule_warning = warning_map[task.id]
+                        elif task.id in processed_ids:
+                            task.schedule_warning = ""  # reset si re-généré sans warning
                 st.success("✅ Planning généré !")
                 st.rerun()
 
@@ -817,8 +911,14 @@ with tab3:
     else:
         # ── Statistiques ──
         st.markdown("---")
+        warned_tasks = [t for t in result.scheduled_tasks if t.schedule_warning]
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("✅ Tâches planifiées", len(result.scheduled_tasks))
+        k1.metric(
+            "✅ Tâches planifiées",
+            len(result.scheduled_tasks),
+            delta=f"dont {len(warned_tasks)} forcées ⚠️" if warned_tasks else None,
+            delta_color="off" if warned_tasks else "normal",
+        )
         k2.metric("❌ Non planifiables", len(result.impossible_tasks))
         k3.metric(
             "📅 Jours avec activité",
@@ -844,6 +944,20 @@ with tab3:
             with st.expander(f"💬 Messages explicatifs ({len(result.messages)})", expanded=False):
                 for msg in result.messages:
                     st.markdown(f"- {msg}")
+
+        # ── Tâches partiellement forcées (≥80%) ──
+        if warned_tasks:
+            st.markdown("---")
+            st.subheader(f"⚠️ Tâches planifiées avec moins de temps ({len(warned_tasks)})")
+            st.caption("Ces tâches ont été retenues car elles sont planifiées à ≥80%. Il manque quelques créneaux.")
+            for task in warned_tasks:
+                st.markdown(
+                    f"""<div style="background:#fff8e1;border:1px solid #f39c12;border-left:5px solid #f39c12;border-radius:8px;padding:10px 14px;margin-bottom:8px;">
+<strong>⚠️ {task.title}</strong> {_priority_badge(task.priority)}<br>
+<em style="color:#e67e22;">{task.schedule_warning}</em>
+</div>""",
+                    unsafe_allow_html=True,
+                )
 
         # ── Tâches impossibles ──
         if result.impossible_tasks:
@@ -939,6 +1053,42 @@ with tab3:
                         if item["type"] == "task" and item.get("reason"):
                             st.caption(f"💡 {item['reason']}")
 
+            # ── Suppression de tâches ──
+            st.markdown("---")
+            all_plan_tasks = result.scheduled_tasks + result.impossible_tasks
+            if all_plan_tasks:
+                with st.expander(f"🗑️ Supprimer des tâches du planning ({len(all_plan_tasks)})", expanded=False):
+                    st.caption("Sélectionnez les tâches à supprimer définitivement, puis confirmez.")
+                    task_options = {
+                        f"{'✅' if t.is_scheduled else '❌'} {t.title} "
+                        f"({'📌' if t.pin_datetime else '🔄' if t.is_recurring else '📅'} "
+                        f"{t.deadline.strftime('%d/%m/%Y')}, {t.duration_hours:.1f}h)": t.id
+                        for t in all_plan_tasks
+                    }
+                    selected_to_delete = st.multiselect(
+                        "Tâches à supprimer",
+                        options=list(task_options.keys()),
+                        key="plan_delete_select",
+                    )
+                    if selected_to_delete:
+                        ids_to_remove = {task_options[s] for s in selected_to_delete}
+                        if st.button(
+                            f"🗑️ Supprimer {len(selected_to_delete)} tâche(s)",
+                            type="primary",
+                            key="plan_delete_btn",
+                        ):
+                            st.session_state.tasks = [
+                                t for t in st.session_state.tasks
+                                if t.id not in ids_to_remove
+                            ]
+                            # Retirer aussi des listes d'export si nécessaire
+                            st.session_state.exported_task_ids = [
+                                tid for tid in st.session_state.exported_task_ids
+                                if tid not in ids_to_remove
+                            ]
+                            st.session_state.schedule_result = None
+                            st.rerun()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — EXPORTER
@@ -961,32 +1111,32 @@ with tab4:
                 "Allez dans l'onglet '📅 Créneaux Occupés' pour vous connecter."
             )
         else:
+            # Tâches disponibles à l'export (non encore exportées)
+            exported_ids_set = set(st.session_state.exported_task_ids)
+            exportable_tasks = [t for t in result.scheduled_tasks if t.id not in exported_ids_set]
+            already_exported_count = len(result.scheduled_tasks) - len(exportable_tasks)
+
+            if already_exported_count:
+                st.success(f"✅ {already_exported_count} tâche(s) déjà exportée(s) vers Google Calendar.")
             st.info(
-                f"**{len(result.scheduled_tasks)} tâche(s) planifiée(s)** prêtes à exporter. "
-                "Sélectionnez celles à ajouter à votre agenda Google."
+                f"**{len(exportable_tasks)} tâche(s) à exporter.** "
+                "Sélectionnez les créneaux à ajouter à votre agenda Google."
             )
 
             # Sélection des blocs à exporter
             blocks_to_export = []
-            for task in result.scheduled_tasks:
+            for task in exportable_tasks:
                 for block in task.scheduled_blocks:
                     block_key = f"{task.id}_{block['date']}_{block['start_time']}"
-                    if block_key not in st.session_state.export_done:
-                        label = (
-                            f"**{task.title}** — "
-                            f"{block['date'].strftime('%d/%m/%Y')} "
-                            f"{block['start_time'].strftime('%H:%M')}–{block['end_time'].strftime('%H:%M')} "
-                            f"({block['duration_hours']:.1f}h)"
-                        )
-                        selected = st.checkbox(label, value=True, key=f"export_{block_key}")
-                        if selected:
-                            blocks_to_export.append((task, block, block_key))
-                    else:
-                        st.markdown(
-                            f"✅ ~~{task.title} — {block['date'].strftime('%d/%m')} "
-                            f"{block['start_time'].strftime('%H:%M')}–{block['end_time'].strftime('%H:%M')}~~"
-                            " *(déjà exporté)*"
-                        )
+                    label = (
+                        f"**{task.title}** — "
+                        f"{block['date'].strftime('%d/%m/%Y')} "
+                        f"{block['start_time'].strftime('%H:%M')}–{block['end_time'].strftime('%H:%M')} "
+                        f"({block['duration_hours']:.1f}h)"
+                    )
+                    selected = st.checkbox(label, value=True, key=f"export_{block_key}")
+                    if selected:
+                        blocks_to_export.append((task, block, block_key))
 
             if blocks_to_export:
                 st.markdown("---")
@@ -998,6 +1148,7 @@ with tab4:
                     success_count = 0
                     errors = []
                     progress = st.progress(0)
+                    exported_in_session: set = set()
                     for i, (task, block, block_key) in enumerate(blocks_to_export):
                         try:
                             start_dt = datetime.combine(block["date"], block["start_time"])
@@ -1013,7 +1164,8 @@ with tab4:
                                 ),
                             )
                             st.session_state.export_done.append(block_key)
-                            # Mémoriser le bloc exporté pour ne pas le re-planifier
+                            exported_in_session.add(task.id)
+                            # Mémoriser le bloc pour bloquer ce créneau à la prochaine génération
                             st.session_state.exported_blocks_detail.append({
                                 "date": block["date"],
                                 "start_time": block["start_time"],
@@ -1023,6 +1175,10 @@ with tab4:
                             success_count += 1
                         except Exception as e:
                             errors.append(f"{task.title} : {e}")
+                    # Marquer les tâches exportées par leur ID
+                    for tid in exported_in_session:
+                        if tid not in st.session_state.exported_task_ids:
+                            st.session_state.exported_task_ids.append(tid)
                         progress.progress((i + 1) / len(blocks_to_export))
 
                     if success_count:

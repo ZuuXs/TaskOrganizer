@@ -61,7 +61,9 @@ class PerplexityAPI:
                     "duration_hours": float,
                     "deadline": "YYYY-MM-DD",
                     "priority": "Basse" | "Normale" | "Haute",
-                    "notes": str
+                    "notes": str,
+                    "exact_datetime": "YYYY-MM-DDTHH:MM" | null,
+                    "recurrence": {"pattern": "daily"|"weekly", "end_date": "YYYY-MM-DD"} | null
                 },
                 ...
             ],
@@ -72,38 +74,66 @@ class PerplexityAPI:
             today = date.today()
 
         default_deadline = (today + timedelta(days=7)).strftime("%Y-%m-%d")
+        tomorrow = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+        one_month = (today + timedelta(days=31)).strftime("%Y-%m-%d")
 
-        system_prompt = f"""Tu es un assistant de planification expert. Analyse le texte de l'utilisateur et extrait toutes les tâches à accomplir.
+        system_prompt = f"""Tu es un extracteur de tâches JSON. TON SEUL RÔLE est d'extraire des tâches depuis le texte de l'utilisateur et de retourner du JSON.
 
-RÈGLES STRICTES :
-1. Retourne UNIQUEMENT un objet JSON valide, sans texte avant ou après.
-2. Chaque tâche doit avoir : title, duration_hours, deadline, priority, notes.
-3. duration_hours : si non précisé, estime selon la complexité (ex: "faire un rapport" = 3h, "réviser pour exam" = 6h, "lire un livre" = 5h, "coder un script" = 4h).
-4. deadline : si non précisé, utilise "{default_deadline}" (1 semaine).
-5. priority : EXACTEMENT "Basse", "Normale", ou "Haute". Si non précisé, estime selon le contexte (exam demain = Haute, etc.).
-6. notes : résumé court des détails supplémentaires.
-7. planning_suggestions : une phrase de conseil sur comment aborder ces tâches.
+RÈGLES ABSOLUES :
+1. Retourne UNIQUEMENT un objet JSON valide. Zéro texte avant ou après.
+2. NE JAMAIS expliquer les sujets mentionnés (nourriture, sport, médicaments, suppléments, etc.).
+3. NE JAMAIS faire de recherche web ou ajouter des informations externes.
+4. Si le texte dit "manger X", "prendre X", "faire X" → extrait-le comme une tâche avec title="X" ou "Manger X", point final.
+5. Chaque tâche : title, duration_hours, deadline, priority, notes, exact_datetime, recurrence.
+
+DURÉE si non précisée — estime :
+- activité physique (sport, marche) = 1h
+- repas, prise de complément = 0.5h
+- rapport, document = 3h
+- révision examen = 4h
+- réunion, RDV = 1h
+
+DEADLINE : date limite. Si exact_datetime est défini, utilise sa date. Sinon "{default_deadline}".
+
+PRIORITÉ : exactement "Basse", "Normale", ou "Haute".
+
+EXACT_DATETIME — si l'utilisateur précise une heure ("à 15h", "at 3pm", "ce soir 20h", "demain matin 9h") :
+  → format "YYYY-MM-DDTHH:MM"
+  → "demain à 15h" = "{tomorrow}T15:00"
+  → "ce soir à 20h" = "{today.strftime('%Y-%m-%d')}T20:00"
+  → sinon : null
+
+RECURRENCE — si l'utilisateur dit "tous les jours", "chaque jour", "every day", "quotidien", "toutes les semaines" :
+  → {{"pattern": "daily" ou "weekly", "end_date": "YYYY-MM-DD"}}
+  → end_date max = {one_month}
+  → si durée non précisée, end_date = dans 7 jours
+  → sinon : null
 
 Date d'aujourd'hui : {today.strftime("%d/%m/%Y")} ({today.strftime("%A")})
 
-FORMAT JSON ATTENDU :
+FORMAT JSON — SEULE RÉPONSE AUTORISÉE :
 {{
     "tasks": [
         {{
             "title": "Titre de la tâche",
-            "duration_hours": 2.5,
+            "duration_hours": 1.0,
             "deadline": "YYYY-MM-DD",
-            "priority": "Haute",
-            "notes": "Détails optionnels"
+            "priority": "Normale",
+            "notes": "",
+            "exact_datetime": null,
+            "recurrence": null
         }}
     ],
-    "planning_suggestions": "Conseil de planification"
+    "planning_suggestions": "Conseil bref"
 }}"""
+
+        # Préfixe explicite pour contraindre l'IA à ne pas chercher sur le web
+        user_message = f"Extrais les tâches de ce texte (JSON uniquement) :\n\n{prompt}"
 
         content = self._chat(
             [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": user_message},
             ]
         )
 
@@ -126,19 +156,52 @@ Réponds en français. Sois concis, positif et actionnable. Utilise des emojis p
         return self._chat([{"role": "user", "content": prompt}], temperature=0.7)
 
     def _parse_json_response(self, content: str) -> Dict[str, Any]:
-        """Extrait et parse le JSON d'une réponse Perplexity."""
-        # Essayer de trouver un bloc JSON dans la réponse
+        """Extrait et parse le JSON d'une réponse Perplexity (robuste aux textes parasites)."""
         content = content.strip()
 
-        # Chercher un bloc ```json ... ``` ou ``` ... ```
+        # 1. Chercher un bloc ```json ... ```
         json_block = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
         if json_block:
-            return json.loads(json_block.group(1))
+            try:
+                return json.loads(json_block.group(1))
+            except json.JSONDecodeError:
+                pass
 
-        # Chercher le JSON directement
-        json_start = content.find("{")
-        json_end = content.rfind("}") + 1
-        if json_start >= 0 and json_end > json_start:
-            return json.loads(content[json_start:json_end])
+        # 2. Extraction robuste par comptage de profondeur (gère le texte autour du JSON)
+        start = content.find("{")
+        if start >= 0:
+            depth = 0
+            in_string = False
+            escape_next = False
+            for i, ch in enumerate(content[start:], start):
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == "\\" and in_string:
+                    escape_next = True
+                    continue
+                if ch == '"' and not escape_next:
+                    in_string = not in_string
+                    continue
+                if not in_string:
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                return json.loads(content[start : i + 1])
+                            except json.JSONDecodeError:
+                                # Essayer le prochain {
+                                next_start = content.find("{", start + 1)
+                                if next_start > start:
+                                    start = next_start
+                                    depth = 0
+                                    in_string = False
 
-        raise ValueError(f"Impossible de parser la réponse JSON : {content[:300]}")
+        raise ValueError(
+            f"Impossible de parser la réponse JSON. "
+            f"L'IA a peut-être retourné du texte au lieu de JSON. "
+            f"Réessayez ou reformulez votre demande. "
+            f"(Réponse reçue : {content[:200]}...)"
+        )

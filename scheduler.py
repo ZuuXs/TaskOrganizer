@@ -1,11 +1,13 @@
 """
-Algorithme de planification greedy.
+Algorithme de planification greedy — approche "day-first".
 
 Flux :
   1. Tâches à heure fixe (pin_datetime) planifiées en priorité.
-  2. Trie les tâches régulières (deadline proche → priorité haute → durée courte).
-  3. Pour chaque tâche, parcourt les jours disponibles et remplit les créneaux libres.
-  4. Les tâches non-planifiables sont marquées IMPOSSIBLE.
+  2. Pour chaque JOUR (et non tâche par tâche), distribue le temps entre toutes
+     les tâches urgentes selon un budget quotidien intelligent.
+  3. Les tâches récurrentes (not_before = deadline) ne sont planifiées que leur jour.
+  4. Pauses automatiques de 15 min après les blocs ≥ 1h30.
+  5. Les tâches non-planifiables sont marquées IMPOSSIBLE.
 """
 
 from __future__ import annotations
@@ -20,9 +22,9 @@ from typing import Dict, List, Optional, Tuple
 
 PRIORITY_VALUES = {"Haute": 3, "Normale": 2, "Basse": 1}
 PRIORITY_COLORS = {
-    "Haute": "#1a5276",   # bleu foncé
-    "Normale": "#2980b9", # bleu moyen
-    "Basse": "#aed6f1",   # bleu clair
+    "Haute": "#1a5276",
+    "Normale": "#2980b9",
+    "Basse": "#aed6f1",
 }
 
 
@@ -35,12 +37,19 @@ class Task:
     notes: str = ""
     id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
 
-    # Heure/date exacte imposée (la tâche DOIT commencer à ce moment)
+    # Heure/date exacte imposée (ignore les contraintes horaires)
     pin_datetime: Optional[datetime] = None
 
-    # Marqueurs pour tâches répétitives
+    # Pas de planification avant cette date (utilisé pour les récurrences)
+    not_before: Optional[date] = None
+
+    # Marqueurs récurrence
     is_recurring: bool = False
-    recurrence_label: str = ""  # Titre de la série pour regroupement
+    recurrence_label: str = ""
+
+    # Statut UI (non copié dans le scheduler — mis à jour depuis app.py)
+    is_new: bool = True          # True = ajoutée depuis le dernier planning
+    schedule_warning: str = ""   # Avertissement si planifiée à ≥80% (temps partiel forcé)
 
     # Rempli après planification
     scheduled_blocks: List[Dict] = field(default_factory=list)
@@ -74,17 +83,16 @@ class OccupiedSlot:
 @dataclass
 class Constraints:
     max_hours_per_day: float = 8.0
-    start_hour: int = 8     # Pas de travail avant 8h
-    end_hour: int = 22      # Pas de travail après 22h
+    start_hour: int = 8
+    end_hour: int = 22
     no_sunday: bool = True
-    lunch_break: bool = True  # Pause repas 12h-13h
+    lunch_break: bool = True
 
 
 # ─── Résultat de planification ─────────────────────────────────────────────────
 
 @dataclass
 class ScheduleResult:
-    # date → liste d'items (occupied ou task blocks)
     calendar: Dict[date, List[Dict]] = field(default_factory=dict)
     scheduled_tasks: List[Task] = field(default_factory=list)
     impossible_tasks: List[Task] = field(default_factory=list)
@@ -95,17 +103,17 @@ class ScheduleResult:
 
 class TaskScheduler:
     """
-    Planificateur greedy avec support des tâches à heure fixe.
+    Planificateur greedy — approche "day-first".
 
-    Paramètres
-    ----------
-    tasks          : liste des tâches à planifier
-    occupied_slots : créneaux déjà occupés (Google Calendar + manuel + exports)
-    constraints    : contraintes de travail
-    horizon_days   : nombre de jours à planifier (défaut 30)
+    Pour chaque jour, distribue le temps disponible entre TOUTES les tâches
+    éligibles selon un budget quotidien intelligent. Cela évite qu'une seule
+    tâche monopolise une journée entière.
     """
 
-    MIN_BLOCK_HOURS = 0.5  # Bloc minimum de 30 minutes
+    MIN_BLOCK_HOURS = 0.5        # Bloc minimum : 30 min
+    MAX_TASK_DAILY_HOURS = 4.0   # Max heures de la même tâche par jour
+    BREAK_THRESHOLD_HOURS = 1.5  # Pause après un bloc ≥ 1h30
+    BREAK_DURATION_HOURS = 0.25  # Pause de 15 min
 
     def __init__(
         self,
@@ -123,11 +131,11 @@ class TaskScheduler:
     def generate_schedule(self) -> ScheduleResult:
         result = ScheduleResult()
 
-        # ── Séparer tâches fixes et tâches greedy ──────────────────────────────
+        # ── Séparer tâches fixes et tâches greedy ─────────────────────────────
         pinned_tasks = [t for t in self.tasks if t.pin_datetime is not None]
         regular_tasks = [t for t in self.tasks if t.pin_datetime is None]
 
-        # ── 1. Planifier les tâches à heure fixe en premier ────────────────────
+        # ── 1. Planifier les tâches à heure fixe en premier ───────────────────
         pinned_occupied: List[Tuple[date, time, time]] = []
         for task in sorted(pinned_tasks, key=lambda t: t.pin_datetime):
             ok = self._schedule_pinned_task(task, result, pinned_occupied)
@@ -151,47 +159,80 @@ class TaskScheduler:
                     f"❌ '{task.title}' (heure fixe) — IMPOSSIBLE : {task.impossible_reason}"
                 )
 
-        # ── 2. Pré-calculer les créneaux libres (excluant les blocs fixes) ─────
+        # ── 2. Pré-calculer les créneaux libres ───────────────────────────────
         free_slots: Dict[date, List[Tuple[time, time]]] = {}
         for i in range(self.horizon_days + 1):
             day = self.today + timedelta(days=i)
             if self._is_working_day(day):
                 slots = self._compute_free_slots(day, pinned_occupied)
                 if slots:
-                    free_slots[day] = slots
+                    free_slots[day] = list(slots)
 
-        # ── 3. Trier et planifier les tâches régulières (greedy) ───────────────
+        # ── 3. Greedy day-first : chaque jour distribue entre plusieurs tâches ─
         sorted_tasks = self._sort_tasks(regular_tasks)
 
-        for task in sorted_tasks:
-            days_in_order = sorted(free_slots.keys())
+        for day in sorted(free_slots.keys()):
+            if not free_slots[day]:
+                continue
 
-            for day in days_in_order:
-                if day > task.deadline:
-                    break
+            already_used = self._task_hours_on_day(result.calendar, day)
+            available_today = self.constraints.max_hours_per_day - already_used
+            if available_today < self.MIN_BLOCK_HOURS:
+                continue
 
+            # Copie mutable des créneaux libres du jour (partagée entre les tâches)
+            day_free = list(free_slots[day])
+
+            for task in sorted_tasks:
                 if task.remaining_hours() < 0.01:
+                    continue
+                if day > task.deadline:
+                    continue
+                # Filtre not_before (tâches récurrentes : seulement leur jour)
+                if task.not_before is not None and day < task.not_before:
+                    continue
+                if available_today < self.MIN_BLOCK_HOURS:
                     break
 
-                already_used = self._task_hours_on_day(result.calendar, day)
-                available_today = self.constraints.max_hours_per_day - already_used
-                if available_today < self.MIN_BLOCK_HOURS:
+                # Budget quotidien intelligent
+                days_until_dl = max(1, (task.deadline - day).days + 1)
+                ideal_daily = task.remaining_hours() / days_until_dl
+                # Minimum requis aujourd'hui pour respecter la deadline
+                min_needed = max(
+                    0.0,
+                    task.remaining_hours() - (days_until_dl - 1) * self.MAX_TASK_DAILY_HOURS,
+                )
+                # Plafond normal : 2× l'idéal mais max MAX_TASK_DAILY_HOURS
+                normal_cap = max(
+                    self.MIN_BLOCK_HOURS,
+                    min(ideal_daily * 2.0, self.MAX_TASK_DAILY_HOURS),
+                )
+                daily_cap = min(
+                    max(min_needed, normal_cap),
+                    task.remaining_hours(),
+                    available_today,
+                )
+
+                if daily_cap < self.MIN_BLOCK_HOURS:
                     continue
 
-                updated_slots = []
-                for slot_start, slot_end in free_slots[day]:
-                    if task.remaining_hours() < 0.01 or available_today < self.MIN_BLOCK_HOURS:
-                        updated_slots.append((slot_start, slot_end))
+                allocated = 0.0
+                new_day_free: List[Tuple[time, time]] = []
+
+                for slot_start, slot_end in day_free:
+                    budget_left = daily_cap - allocated
+                    if budget_left < self.MIN_BLOCK_HOURS or available_today < self.MIN_BLOCK_HOURS:
+                        new_day_free.append((slot_start, slot_end))
                         continue
 
                     slot_dur = _time_diff_hours(slot_start, slot_end)
                     if slot_dur < self.MIN_BLOCK_HOURS:
-                        updated_slots.append((slot_start, slot_end))
+                        new_day_free.append((slot_start, slot_end))
                         continue
 
-                    use = min(task.remaining_hours(), slot_dur, available_today)
+                    use = min(budget_left, slot_dur, available_today)
                     if use < self.MIN_BLOCK_HOURS:
-                        updated_slots.append((slot_start, slot_end))
+                        new_day_free.append((slot_start, slot_end))
                         continue
 
                     block_end = _add_hours_to_time(slot_start, use)
@@ -208,43 +249,72 @@ class TaskScheduler:
                         "reason": _build_reason(task, day),
                     }
 
-                    if day not in result.calendar:
-                        result.calendar[day] = []
-                    result.calendar[day].append(block)
-
-                    task.scheduled_blocks.append(
-                        {"date": day, "start_time": slot_start, "end_time": block_end, "duration_hours": use}
-                    )
+                    result.calendar.setdefault(day, []).append(block)
+                    task.scheduled_blocks.append({
+                        "date": day,
+                        "start_time": slot_start,
+                        "end_time": block_end,
+                        "duration_hours": use,
+                    })
                     result.messages.append(
                         f"✅ '{task.title}' → {day.strftime('%d/%m')} "
                         f"{slot_start.strftime('%H:%M')}-{block_end.strftime('%H:%M')} "
                         f"({_build_reason(task, day)})"
                     )
 
+                    allocated += use
                     available_today -= use
 
-                    if block_end < slot_end:
-                        updated_slots.append((block_end, slot_end))
+                    # Pause intelligente après un long bloc
+                    if use >= self.BREAK_THRESHOLD_HOURS:
+                        pause_end = _add_hours_to_time(block_end, self.BREAK_DURATION_HOURS)
+                        if pause_end < slot_end:
+                            new_day_free.append((pause_end, slot_end))
+                        # sinon le créneau est entièrement consommé (pause incluse)
+                    else:
+                        if block_end < slot_end:
+                            new_day_free.append((block_end, slot_end))
 
-                free_slots[day] = updated_slots
+                day_free = new_day_free
 
-            # Verdict final
+            free_slots[day] = day_free
+
+        # ── 4. Verdict final pour chaque tâche régulière ──────────────────────
+        FORCE_THRESHOLD = 0.80  # ≥80% planifié → forcer comme planifié
+
+        for task in sorted_tasks:
             if task.remaining_hours() < 0.01:
                 task.is_scheduled = True
                 task.is_impossible = False
                 result.scheduled_tasks.append(task)
             elif task.scheduled_hours() > 0:
-                task.is_scheduled = False
-                task.is_impossible = True
-                task.impossible_reason = (
-                    f"Seulement {task.scheduled_hours():.1f}h/{task.duration_hours:.1f}h planifiées "
-                    f"avant la deadline du {task.deadline.strftime('%d/%m/%Y')}."
-                )
-                result.impossible_tasks.append(task)
-                result.messages.append(
-                    f"⚠️ '{task.title}' partiellement planifiée "
-                    f"({task.scheduled_hours():.1f}h/{task.duration_hours:.1f}h) — NON PLANIFIABLE entièrement."
-                )
+                pct = task.scheduled_hours() / task.duration_hours
+                if pct >= FORCE_THRESHOLD:
+                    # ≥80% → forcer comme planifié, ajouter un avertissement
+                    task.is_scheduled = True
+                    task.is_impossible = False
+                    task.schedule_warning = (
+                        f"{task.scheduled_hours():.1f}h/{task.duration_hours:.1f}h planifiées "
+                        f"({pct:.0%}) — pas assez de créneaux disponibles avant le "
+                        f"{task.deadline.strftime('%d/%m/%Y')}."
+                    )
+                    result.scheduled_tasks.append(task)
+                    result.messages.append(
+                        f"⚠️ '{task.title}' forcé à {pct:.0%} — manque de créneaux."
+                    )
+                else:
+                    # <80% → non planifiable
+                    task.is_scheduled = False
+                    task.is_impossible = True
+                    task.impossible_reason = (
+                        f"Seulement {task.scheduled_hours():.1f}h/{task.duration_hours:.1f}h "
+                        f"planifiées ({pct:.0%}) — insuffisant. "
+                        f"Réduisez la durée ou repoussez la deadline."
+                    )
+                    result.impossible_tasks.append(task)
+                    result.messages.append(
+                        f"❌ '{task.title}' : {pct:.0%} planifié — insuffisant, non retenu."
+                    )
             else:
                 task.is_scheduled = False
                 task.is_impossible = True
@@ -254,22 +324,20 @@ class TaskScheduler:
                     f"❌ '{task.title}' — NON PLANIFIABLE : {task.impossible_reason}"
                 )
 
-        # ── 4. Ajouter les créneaux occupés au calendrier ──────────────────────
+        # ── 5. Ajouter les créneaux occupés au calendrier ─────────────────────
         for slot in self.occupied_slots:
             if slot.date not in result.calendar:
                 result.calendar[slot.date] = []
-            result.calendar[slot.date].append(
-                {
-                    "type": "occupied",
-                    "title": slot.title or slot.slot_type,
-                    "slot_type": slot.slot_type,
-                    "start_time": slot.start_time,
-                    "end_time": slot.end_time,
-                    "color": "#e74c3c",
-                }
-            )
+            result.calendar[slot.date].append({
+                "type": "occupied",
+                "title": slot.title or slot.slot_type,
+                "slot_type": slot.slot_type,
+                "start_time": slot.start_time,
+                "end_time": slot.end_time,
+                "color": "#e74c3c",
+            })
 
-        # ── 5. Trier chaque journée par heure de début ─────────────────────────
+        # ── 6. Trier chaque journée par heure de début ────────────────────────
         for day in result.calendar:
             result.calendar[day].sort(key=lambda x: x["start_time"])
 
@@ -283,18 +351,10 @@ class TaskScheduler:
         result: ScheduleResult,
         pinned_occupied: List[Tuple[date, time, time]],
     ) -> bool:
-        """Planifie une tâche à heure fixe. Retourne True si succès."""
+        """Planifie une tâche à heure fixe. Ignore les contraintes horaires."""
         pin_date = task.pin_datetime.date()
         pin_start = task.pin_datetime.time().replace(second=0, microsecond=0)
         pin_end = _add_hours_to_time(pin_start, task.duration_hours)
-
-        # Vérifier plage horaire autorisée
-        if pin_start < time(self.constraints.start_hour, 0) or pin_end > time(self.constraints.end_hour, 0):
-            task.impossible_reason = (
-                f"Heure hors plage de travail "
-                f"({self.constraints.start_hour}h–{self.constraints.end_hour}h)"
-            )
-            return False
 
         # Vérifier conflits avec créneaux occupés
         for occ in self.occupied_slots:
@@ -316,7 +376,6 @@ class TaskScheduler:
                     )
                     return False
 
-        # Planifier le bloc
         block = {
             "type": "task",
             "task_id": task.id,
@@ -329,10 +388,7 @@ class TaskScheduler:
             "reason": f"📌 Heure fixée — {_build_reason(task, pin_date)}",
         }
 
-        if pin_date not in result.calendar:
-            result.calendar[pin_date] = []
-        result.calendar[pin_date].append(block)
-
+        result.calendar.setdefault(pin_date, []).append(block)
         task.scheduled_blocks.append({
             "date": pin_date,
             "start_time": pin_start,
@@ -363,7 +419,7 @@ class TaskScheduler:
         d: date,
         pinned_occupied: Optional[List[Tuple[date, time, time]]] = None,
     ) -> List[Tuple[time, time]]:
-        """Calcule les créneaux libres d'une journée (contraintes + occupés + fixes)."""
+        """Calcule les créneaux libres d'une journée."""
         s = time(self.constraints.start_hour, 0)
         e = time(self.constraints.end_hour, 0)
         slots = [(s, e)]
@@ -375,7 +431,6 @@ class TaskScheduler:
             if occ.date == d:
                 slots = _subtract_range(slots, occ.start_time, occ.end_time)
 
-        # Soustraire les blocs de tâches fixes déjà planifiées
         if pinned_occupied:
             for p_date, p_start, p_end in pinned_occupied:
                 if p_date == d:
@@ -393,10 +448,18 @@ class TaskScheduler:
         )
 
     def _explain_impossible(self, task: Task, free_slots: Dict[date, List[Tuple[time, time]]]) -> str:
+        # Cas spécial tâche récurrente liée à un jour précis
+        if task.not_before is not None and task.not_before == task.deadline:
+            if task.not_before not in free_slots:
+                if not self._is_working_day(task.not_before):
+                    return f"Le {task.not_before.strftime('%d/%m/%Y')} est un jour non travaillé."
+                return f"Aucun créneau libre le {task.not_before.strftime('%d/%m/%Y')} (journée pleine)."
+
         total_free = sum(
             sum(_time_diff_hours(s, e) for s, e in slots)
             for d, slots in free_slots.items()
             if d <= task.deadline
+            and (task.not_before is None or d >= task.not_before)
         )
         if total_free < task.duration_hours:
             return (
@@ -415,21 +478,21 @@ class TaskScheduler:
             notes=t.notes,
             id=t.id,
             pin_datetime=t.pin_datetime,
+            not_before=t.not_before,
             is_recurring=t.is_recurring,
             recurrence_label=t.recurrence_label,
+            # is_new et schedule_warning sont gérés côté app.py, pas dans le scheduler
         )
 
 
 # ─── Utilitaires temps ─────────────────────────────────────────────────────────
 
 def _time_diff_hours(a: time, b: time) -> float:
-    """Différence en heures entre deux time (b - a). Retourne 0 si b <= a."""
     minutes = (b.hour * 60 + b.minute) - (a.hour * 60 + a.minute)
     return max(0.0, minutes / 60.0)
 
 
 def _add_hours_to_time(t: time, hours: float) -> time:
-    """Ajoute des heures à un time (sans dépasser minuit)."""
     total_minutes = t.hour * 60 + t.minute + int(round(hours * 60))
     total_minutes = min(total_minutes, 23 * 60 + 59)
     return time(total_minutes // 60, total_minutes % 60)
@@ -438,13 +501,12 @@ def _add_hours_to_time(t: time, hours: float) -> time:
 def _subtract_range(
     slots: List[Tuple[time, time]], rem_start: time, rem_end: time
 ) -> List[Tuple[time, time]]:
-    """Soustrait un intervalle [rem_start, rem_end] d'une liste de créneaux libres."""
     result = []
     for s, e in slots:
         if rem_end <= s or rem_start >= e:
             result.append((s, e))
         elif rem_start <= s and rem_end >= e:
-            pass  # entièrement recouvert
+            pass
         elif rem_start > s and rem_end < e:
             result.append((s, rem_start))
             result.append((rem_end, e))
